@@ -48,6 +48,12 @@ class CartesianController(BaseController):
         ]
 
         self.arms = self.duatic_robots_helper.get_component_names("arm")
+        # Match focus behavior with discovered components (single-arm setups often use "").
+        self.focused_component = (
+            "arm_left"
+            if "arm_left" in self.arms
+            else (self.arms[0] if self.arms else "")
+        )
         found_topics = self.duatic_jtc_helper.find_topics_for_controller(
             "cartesian_pose_controller", "target_pose", self.arms
         )
@@ -64,16 +70,40 @@ class CartesianController(BaseController):
             self.cartesian_publishers[topic] = self.node.create_publisher(PoseStamped, topic, 10)
             self.node.get_logger().debug(f"Created publisher for topic: {topic}")
 
+        self.pin_helper = DuaticPinocchioHelper(self.node)  # Product-agnostic
         if len(self.arms) >= 2:
-            self.base_frame = "tbase"
-            self.pin_helper = DuaticPinocchioHelper(self.node)  # Product-agnostic
+            preferred_base_frame = "tbase"
         else:
-            self.base_frame = "world"
-            self.pin_helper = DuaticPinocchioHelper(self.node)
+            preferred_base_frame = "world"
+        self.base_frame = self._resolve_base_frame(preferred_base_frame)
 
         self.marker_helper = DuaticMarkerHelper(self.node)
 
         self.node.get_logger().info("Cartesian controller initialized.")
+
+    def _resolve_base_frame(self, preferred_base_frame):
+        """Return a frame name that exists in the Pinocchio model."""
+        model = self.pin_helper.model
+
+        candidates = [preferred_base_frame, "tbase", "world", "base_link", "base"]
+        for frame in candidates:
+            if model.existFrame(frame):
+                if frame != preferred_base_frame:
+                    self.node.get_logger().warn(
+                        f"Base frame '{preferred_base_frame}' not found. Falling back to '{frame}'."
+                    )
+                return frame
+
+        # Last-resort fallback: first non-universe frame available in the model.
+        for frame in model.frames:
+            if frame.name and frame.name != "universe":
+                self.node.get_logger().warn(
+                    f"No standard base frame found. Using model frame '{frame.name}'."
+                )
+                return frame.name
+
+        self.node.get_logger().warn("No valid model frame found. Using 'world'.")
+        return "world"
 
     def _get_name_for_arm(self, arm_name, frame_name):
         """Get frame name for specific arm"""

@@ -29,6 +29,7 @@ from duatic_dynaarm_extensions.duatic_helpers.duatic_robots_helper import Duatic
 from duatic_gamepad_interface.controllers.joint_trajectory_controller import (
     JointTrajectoryController,
 )
+from duatic_gamepad_interface.controllers.cartesian_controller import CartesianController
 from duatic_gamepad_interface.controllers.freedrive_controller import FreedriveController
 from duatic_gamepad_interface.controllers.mecanum_controller import MecanumController
 from duatic_gamepad_interface.controllers.gripper_controller import GripperController
@@ -43,6 +44,10 @@ class ControllerManager:
 
         self.active_high_level_controller_index = -1
         self.active_low_level_controllers = []
+        self.no_active_controller_ticks = 0
+        self.no_active_controller_threshold = 3
+        self.controller_refresh_interval_ns = int(2.0 * 1e9)
+        self.last_controller_refresh_ns = 0
         self.is_freeze_active = True  # Assume freeze is active until proven otherwise
         self.emergency_button_was_pressed = False
 
@@ -55,7 +60,8 @@ class ControllerManager:
         self.all_potential_controllers = {
             0: FreedriveController(self.node, duatic_robots_helper),
             1: JointTrajectoryController(self.node, duatic_robots_helper),
-            2: MecanumController(self.node, duatic_robots_helper),
+            2: CartesianController(self.node, duatic_robots_helper),
+            3: MecanumController(self.node, duatic_robots_helper),
         }
 
         self.gripper_controller = GripperController(self.node, duatic_robots_helper)
@@ -96,7 +102,6 @@ class ControllerManager:
         self.node.get_logger().info(f"Available system controllers: {all_system_controllers}")
 
         available_controllers = {}
-        new_index = 0
 
         for idx, controller in self.all_potential_controllers.items():
             controller_name = controller.__class__.__name__
@@ -124,11 +129,10 @@ class ControllerManager:
                 # A controller is available if at least as many matching LLCs are found as required
                 # (This handles both base pattern requirements and specific instance requirements)
                 if len(matching_controllers) >= len(required_controllers):
-                    available_controllers[new_index] = controller
+                    available_controllers[idx] = controller
                     self.node.get_logger().info(
-                        f"✅ {controller_name} (index {new_index}) - Available (requires: {required_controllers})"
+                        f"✅ {controller_name} (index {idx}) - Available (requires: {required_controllers})"
                     )
-                    new_index += 1
                 else:
                     # Determine what exactly is missing for the log
                     missing = [r for r in required_controllers if r not in matching_controllers]
@@ -175,6 +179,16 @@ class ControllerManager:
     def check_active_low_level_controllers(self):
         """Checks which controllers are active and updates the state machine."""
 
+        # Startup race guard: controller_manager may come up after this node.
+        # Retry controller discovery periodically until at least one HLC is available.
+        now_ns = self.node.get_clock().now().nanoseconds
+        if (
+            not self.all_high_level_controllers
+            and now_ns - self.last_controller_refresh_ns >= self.controller_refresh_interval_ns
+        ):
+            self.last_controller_refresh_ns = now_ns
+            self._filter_available_controllers()
+
         self.is_freeze_active = self.duatic_controller_helper.is_freeze_active()
 
         if self.is_freeze_active and not self.emergency_button_was_pressed:
@@ -193,25 +207,31 @@ class ControllerManager:
 
         active_low_level_controllers = self.duatic_controller_helper.get_active_controllers()
         if not active_low_level_controllers or len(active_low_level_controllers) <= 0:
-            self.node.get_logger().warn("No active controller found.", throttle_duration_sec=30.0)
-            self.active_high_level_controller_index = -1
-            self.active_low_level_controllers.clear()
+            # Debounce transient empty reads during controller switches.
+            self.no_active_controller_ticks += 1
+            if self.no_active_controller_ticks >= self.no_active_controller_threshold:
+                self.node.get_logger().warn("No active controller found.", throttle_duration_sec=30.0)
+                self.active_high_level_controller_index = -1
+                self.active_low_level_controllers.clear()
             return
+
+        self.no_active_controller_ticks = 0
+        normalized_active_low_level_controllers = sorted(set(active_low_level_controllers))
 
         # Compare the lists of active low-level controllers. If nothing changed and
         # a valid high-level controller is already selected, there is nothing to do.
         if (
-            active_low_level_controllers == self.active_low_level_controllers
+            normalized_active_low_level_controllers == self.active_low_level_controllers
             and self.active_high_level_controller_index >= 0
         ):
             self.node.get_logger().debug(
-                f"Active low-level controllers remain unchanged: {active_low_level_controllers}"
+                f"Active low-level controllers remain unchanged: {normalized_active_low_level_controllers}"
             )
             return
 
         # Persist the latest active low-level controller snapshot so external
         # controller switches can be detected on subsequent timer ticks.
-        self.active_low_level_controllers = list(active_low_level_controllers)
+        self.active_low_level_controllers = normalized_active_low_level_controllers
 
         # Find the best matching controller (one with most required controllers satisfied)
         best_controller_idx = -1
@@ -220,7 +240,7 @@ class ControllerManager:
         for idx, high_level_controller in self.all_high_level_controllers.items():
             if hasattr(high_level_controller, "get_low_level_controllers"):
                 required = set(high_level_controller.get_low_level_controllers())
-                active = set(active_low_level_controllers)
+                active = set(normalized_active_low_level_controllers)
 
                 # Check if all required controllers are "contained" in active controllers
                 required_found = True
@@ -336,8 +356,7 @@ class ControllerManager:
             controllers_to_activate, controllers_to_deactivate
         )
 
-        for idx, high_level_controller in self.all_high_level_controllers.items():
-            high_level_controller.reset()
+        next_high_level_controller.reset()
 
     def trigger_llc_sync(self):
         """Synchronize low-level controllers based on the current high-level controller's needs."""
