@@ -41,7 +41,7 @@ class CartesianController(BaseController):
 
         self.ee_frame = "flange"
         self.current_pose = None
-        self.scale = 0.05
+        self.scale = 0.05 # can be reduced for testing, makes the robot slower
 
         self.needed_low_level_controllers = [
             "cartesian_pose_controller",
