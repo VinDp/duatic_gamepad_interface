@@ -24,55 +24,55 @@
 from duatic_gamepad_interface.controllers.base_controller import BaseController
 
 import rclpy
-from rclpy.qos import QoSProfile
+from rclpy.action import ActionClient, get_action_names_and_types
 
-from std_msgs.msg import Float64MultiArray
+from control_msgs.action import ParallelGripperCommand
 
 
 class GripperController(BaseController):
     """Handles gripper control."""
 
+    OPEN_POSITION = 0.025
+    CLOSE_POSITION = 0.0
+
     def __init__(self, node, duatic_robots_helper):
         super().__init__(node, duatic_robots_helper)
 
         self.needed_capabilities = ["manipulation"]
-        self.needed_low_level_controllers = ["gripper_controller"]
-        self.gripper_topic_suffix = "gripper_controller/commands"
+        self.needed_low_level_controllers = ["gripper_action_controller"]
+        self.gripper_action_suffix = "gripper_action_controller/gripper_cmd"
 
-        # Dictionary to store publishers: {component_name: publisher}
-        self.gripper_publishers = {}
-        self._setup_gripper_publishers()
+        # Dictionary to store action clients: {component_name: client}
+        self.gripper_clients = {}
 
         # Track gripper state per component
         self._gripper_states = {}
         self._last_button_state = False
 
-    def _setup_gripper_publishers(self):
-        """Discover and create publishers for all available grippers with retries."""
+        self._setup_gripper_clients()
+
+    def _setup_gripper_clients(self):
+        """Discover and create action clients for all available grippers with retries."""
         max_retries = 20
         retry_count = 0
-        qos_profile = QoSProfile(depth=1)
 
         while retry_count < max_retries:
-            all_topics = [t[0] for t in self.node.get_topic_names_and_types()]
+            all_actions = get_action_names_and_types(self.node)
 
-            for topic in all_topics:
-                if topic.endswith(self.gripper_topic_suffix):
-                    # Extract component name from topic e.g. /arm_left/gripper_controller/commands
-                    component = self.get_arm_from_topic(topic)
-                    if component and component not in self.gripper_publishers:
-                        self.gripper_publishers[component] = self.node.create_publisher(
-                            Float64MultiArray, topic, qos_profile
+            for action_name, _ in all_actions:
+                if action_name.endswith(self.gripper_action_suffix):
+                    # Extract component from action name; fall back to "default" for non-namespaced setups.
+                    component = self.get_arm_from_topic(action_name) or "default"
+                    if component not in self.gripper_clients:
+                        self.gripper_clients[component] = ActionClient(
+                            self.node, ParallelGripperCommand, action_name
                         )
                         self._gripper_states[component] = False
                         self.node.get_logger().info(
-                            f"Gripper publisher created for {component} on {topic}"
+                            f"Gripper action client created for {component} on {action_name}"
                         )
 
-            # If we already have some publishers, we can be more lenient, but let's try to find all possible ones
-            # For now, if we found at least one or enough retries passed, we continue
-            if self.gripper_publishers:
-                # Give it a bit more time if we think there should be more, but don't block forever
+            if self.gripper_clients:
                 if retry_count > 5:
                     break
 
@@ -80,15 +80,16 @@ class GripperController(BaseController):
             retry_count += 1
 
     def send_gripper_command(self, component, position: float):
-        """Send a command to a specific gripper."""
-        pub = self.gripper_publishers.get(component)
-        if pub:
-            msg = Float64MultiArray()
-            msg.data = [position]
-            pub.publish(msg)
-            self.node.get_logger().info(f"Sent gripper command to {component}: {position}")
-        else:
-            self.node.get_logger().warn(f"No gripper publisher for {component}")
+        """Send a goal to a specific gripper action server."""
+        client = self.gripper_clients.get(component) or self.gripper_clients.get("default")
+        if not client:
+            self.node.get_logger().warn(f"No gripper action client for {component}")
+            return
+
+        goal = ParallelGripperCommand.Goal()
+        goal.command.position = [position]
+        client.send_goal_async(goal)
+        self.node.get_logger().info(f"Sent gripper command to {component}: {position}")
 
     def process_input(self, joy_msg):
         # Safety: Only process gripper if deadman is active
@@ -107,9 +108,10 @@ class GripperController(BaseController):
         if hasattr(joy_msg, "buttons") and len(joy_msg.buttons) > 0:
             button_pressed = bool(joy_msg.buttons[0])
             if button_pressed and not self._last_button_state:
-                # Toggle state for focused component
-                is_open = not self._gripper_states.get(focus, False)
-                self._gripper_states[focus] = is_open
-                position = 1.0 if is_open else 0.0
+                # Toggle state under the same key used to register the client
+                state_key = focus if focus in self._gripper_states else "default"
+                is_open = not self._gripper_states.get(state_key, False)
+                self._gripper_states[state_key] = is_open
+                position = self.OPEN_POSITION if is_open else self.CLOSE_POSITION
                 self.send_gripper_command(focus, position)
             self._last_button_state = button_pressed

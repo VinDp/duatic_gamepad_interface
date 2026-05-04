@@ -198,19 +198,20 @@ class ControllerManager:
             self.active_low_level_controllers.clear()
             return
 
-        # Compare the lists of active_low_level_controllers
-        if active_low_level_controllers == self.active_low_level_controllers:
+        # Compare the lists of active low-level controllers. If nothing changed and
+        # a valid high-level controller is already selected, there is nothing to do.
+        if (
+            active_low_level_controllers == self.active_low_level_controllers
+            and self.active_high_level_controller_index >= 0
+        ):
             self.node.get_logger().debug(
                 f"Active low-level controllers remain unchanged: {active_low_level_controllers}"
             )
             return
 
-        # Only set high-level controller if none was set before
-        if self.active_high_level_controller_index >= 0:
-            self.node.get_logger().debug(
-                f"High level controller already set: {self.active_high_level_controller_index}"
-            )
-            return
+        # Persist the latest active low-level controller snapshot so external
+        # controller switches can be detected on subsequent timer ticks.
+        self.active_low_level_controllers = list(active_low_level_controllers)
 
         # Find the best matching controller (one with most required controllers satisfied)
         best_controller_idx = -1
@@ -242,14 +243,22 @@ class ControllerManager:
                         best_controller_idx = idx
                         best_controller_score = score
 
-        # Activate the best matching controller
+        # Activate/update the best matching controller
         if best_controller_idx >= 0:
-            self.active_high_level_controller_index = best_controller_idx
+            if best_controller_idx != self.active_high_level_controller_index:
+                self.active_high_level_controller_index = best_controller_idx
+                self.node.get_logger().info(
+                    f"Activated high level controller index: {best_controller_idx}"
+                )
+
             best_controller = self.all_high_level_controllers[best_controller_idx]
             best_controller.reset()
-            self.node.get_logger().info(
-                f"Activated high level controller index: {best_controller_idx}"
-            )
+        else:
+            if self.active_high_level_controller_index != -1:
+                self.node.get_logger().warn(
+                    "No matching high-level controller found for currently active low-level controllers."
+                )
+            self.active_high_level_controller_index = -1
 
     def switch_to_next_controller(self):
         """Switch to the next high-level controller. Only switch low-level controller if needed."""
