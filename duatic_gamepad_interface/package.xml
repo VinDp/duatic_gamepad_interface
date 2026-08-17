@@ -17,7 +17,7 @@
   <depend>geometry_msgs</depend>
   <depend>trajectory_msgs</depend>
   <depend>control_msgs</depend>
-  <depend>duatic_dynaarm_extensions</depend>
+  <depend>duatic_helpers</depend>
   <depend>ament_index_python</depend>
 
   <test_depend>ament_cmake_pytest</test_depend>
